@@ -421,6 +421,12 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 			}
 			config.Namespaces.Add(t, ns.Path)
 		}
+		// In a user namespace the kernel only allows mounting sysfs if the process is also
+		// in a network namespace (see https://github.com/nestybox/sysbox/issues/67).
+		// If the CRI did not pass a network namespace, create one so the sandbox init can mount sysfs.
+		if config.Namespaces.Contains(configs.NEWUSER) && !config.Namespaces.Contains(configs.NEWNET) {
+			config.Namespaces.Add(configs.NEWNET, "")
+		}
 		if config.Namespaces.Contains(configs.NEWNET) && config.Namespaces.PathOf(configs.NEWNET) == "" {
 			config.Networks = []*configs.Network{
 				{

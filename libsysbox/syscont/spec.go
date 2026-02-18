@@ -282,11 +282,13 @@ var syscontSystemdRwPaths = []string{
 }
 
 // cfgNamespaces checks that the namespace config has the minimum set
-// of namespaces required and adds any missing namespaces to it
-func cfgNamespaces(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
+// of namespaces required and adds any missing namespaces to it.
+// When sbox.ExternalUserNS is true, the user namespace is not added (it is
+// already provided by K8s/Containerd); UID/GID mappings are the source of truth.
+func cfgNamespaces(sysMgr *sysbox.Mgr, spec *specs.Spec, sbox *sysbox.Sysbox) error {
 
 	// user-ns and cgroup-ns are not required per the OCI spec, but we will add
-	// them to the system container spec.
+	// them to the system container spec (unless external UserNS is in use).
 	var allNs = []string{"pid", "ipc", "uts", "mount", "network", "user", "cgroup"}
 	var reqNs = []string{"pid", "ipc", "uts", "mount", "network"}
 
@@ -305,11 +307,18 @@ func cfgNamespaces(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
 		specNsSet.Add(string(ns.Type))
 	}
 
-	if !reqNsSet.IsSubset(specNsSet) {
+	// When ExternalUserNS is true (e.g. K8s/containerd user namespaces), the CRI may omit
+	// pid/mount (or other) namespace entries; we add any missing required namespaces below
+	// instead of failing. When ExternalUserNS is false, we require the spec to already
+	// have all required namespaces (no sharing with host).
+	if !sbox.ExternalUserNS && !reqNsSet.IsSubset(specNsSet) {
 		return fmt.Errorf("sysbox containers can't share namespaces %v with the host (because they use the linux user-namespace for isolation)", reqNsSet.Difference(specNsSet).ToSlice())
 	}
 
 	addNsSet := allNsSet.Difference(specNsSet)
+	if sbox.ExternalUserNS {
+		addNsSet = addNsSet.Difference(mapset.NewSet("user"))
+	}
 	for ns := range addNsSet.Iter() {
 		str := fmt.Sprintf("%v", ns)
 		newns := specs.LinuxNamespace{
@@ -429,9 +438,44 @@ func validateIDMappings(spec *specs.Spec) error {
 	return nil
 }
 
+// validateExternalIDMappings checks that K8s/Containerd-provided UID/GID mappings
+// meet Sysbox's requirements (e.g., mapping size at least IdRangeMin).
+func validateExternalIDMappings(sbox *sysbox.Sysbox) error {
+	if len(sbox.ExternalUidMappings) == 0 || len(sbox.ExternalGidMappings) == 0 {
+		return fmt.Errorf("external user-ns requires non-empty UID and GID mappings")
+	}
+	// Require at least one UID mapping covering container ID 0 with size >= IdRangeMin
+	var uidOk bool
+	for _, m := range sbox.ExternalUidMappings {
+		if m.ContainerID == 0 && m.Size >= IdRangeMin && m.HostID != 0 {
+			uidOk = true
+			break
+		}
+	}
+	if !uidOk {
+		return fmt.Errorf("external UID mappings must include a range of at least %d IDs starting at container ID 0, and must not map to host ID 0", IdRangeMin)
+	}
+	var gidOk bool
+	for _, m := range sbox.ExternalGidMappings {
+		if m.ContainerID == 0 && m.Size >= IdRangeMin && m.HostID != 0 {
+			gidOk = true
+			break
+		}
+	}
+	if !gidOk {
+		return fmt.Errorf("external GID mappings must include a range of at least %d IDs starting at container ID 0, and must not map to host ID 0", IdRangeMin)
+	}
+	return nil
+}
+
 // cfgIDMappings checks if the uid/gid mappings are present and valid; if they are not
-// present, it allocates them.
-func cfgIDMappings(sysMgr *sysbox.Mgr, spec *specs.Spec) error {
+// present, it allocates them. When sbox.ExternalUserNS is true, internal allocation
+// is skipped and only the provided external mappings are validated.
+func cfgIDMappings(sysMgr *sysbox.Mgr, spec *specs.Spec, sbox *sysbox.Sysbox) error {
+
+	if sbox.ExternalUserNS {
+		return validateExternalIDMappings(sbox)
+	}
 
 	// Honor user-ns uid & gid mapping spec overrides from sysbox-mgr; this occur
 	// when a container shares the same userns and netns of another container (i.e.,
@@ -1340,11 +1384,11 @@ func ConvertSpec(context *cli.Context, spec *specs.Spec, sbox *sysbox.Sysbox) er
 		return fmt.Errorf("invalid or unsupported container spec: %v", err)
 	}
 
-	if err := cfgNamespaces(sysMgr, spec); err != nil {
+	if err := cfgNamespaces(sysMgr, spec, sbox); err != nil {
 		return fmt.Errorf("invalid or unsupported container spec: %v", err)
 	}
 
-	if err := cfgIDMappings(sysMgr, spec); err != nil {
+	if err := cfgIDMappings(sysMgr, spec, sbox); err != nil {
 		return fmt.Errorf("invalid user/group ID config: %v", err)
 	}
 
@@ -1365,6 +1409,20 @@ func ConvertSpec(context *cli.Context, spec *specs.Spec, sbox *sysbox.Sysbox) er
 	sbox.RootfsUidShiftType = rootfsUidShiftType
 	sbox.BindMntUidShiftType = bindMntUidShiftType
 	sbox.RootfsCloned = rootfsCloned
+
+	// When using external UserNS, avoid double-shifting: if the rootfs is already
+	// on an ID-mapped mount (e.g., from K8s/Containerd), disable Sysbox's internal
+	// shiftfs/overlay-shift for the rootfs so we don't apply shifting twice.
+	if sbox.ExternalUserNS {
+		rootfsOnIDMap, err := sysbox.RootfsOnIDMappedMount(spec.Root.Path)
+		if err != nil {
+			return fmt.Errorf("failed to check if rootfs is on ID-mapped mount: %v", err)
+		}
+		if rootfsOnIDMap {
+			logrus.Info("Rootfs is already on an ID-mapped mount; disabling Sysbox rootfs shift to prevent double-shifting.")
+			sbox.RootfsUidShiftType = sh.NoShift
+		}
+	}
 
 	if err := cfgMounts(spec, sbox); err != nil {
 		return fmt.Errorf("invalid mount config: %v", err)

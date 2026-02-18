@@ -57,8 +57,11 @@ func (mgr *Mgr) Enabled() bool {
 }
 
 // Registers the container with sysbox-mgr. If successful, stores the
-// sysbox configuration tokens for sysbox-runc in mgr.Config
-func (mgr *Mgr) Register(spec *specs.Spec) error {
+// sysbox configuration tokens for sysbox-runc in mgr.Config.
+// When sbox.ExternalUserNS is true, the provided UID/GID mappings are
+// passed so sysbox-mgr does not allocate from its pool and configures
+// sysbox-fs to use these mappings for ownership translation.
+func (mgr *Mgr) Register(spec *specs.Spec, sbox *Sysbox) error {
 	var userns string
 	var netns string
 
@@ -76,13 +79,21 @@ func (mgr *Mgr) Register(spec *specs.Spec) error {
 		}
 	}
 
+	uidMappings := spec.Linux.UIDMappings
+	gidMappings := spec.Linux.GIDMappings
+	if sbox.ExternalUserNS {
+		uidMappings = sbox.ExternalUidMappings
+		gidMappings = sbox.ExternalGidMappings
+	}
+
 	regInfo := &ipcLib.RegistrationInfo{
-		Id:          mgr.Id,
-		Rootfs:      rootfs,
-		Userns:      userns,
-		Netns:       netns,
-		UidMappings: spec.Linux.UIDMappings,
-		GidMappings: spec.Linux.GIDMappings,
+		Id:             mgr.Id,
+		Rootfs:         rootfs,
+		Userns:         userns,
+		Netns:          netns,
+		UidMappings:    uidMappings,
+		GidMappings:    gidMappings,
+		ExternalUserNS: sbox.ExternalUserNS,
 	}
 
 	config, err := sysboxMgrGrpc.Register(regInfo)

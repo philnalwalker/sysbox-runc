@@ -19,6 +19,7 @@ package sysbox
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -26,22 +27,27 @@ import (
 	sh "github.com/nestybox/sysbox-libs/idShiftUtils"
 	linuxUtils "github.com/nestybox/sysbox-libs/linuxUtils"
 	libutils "github.com/nestybox/sysbox-libs/utils"
+	"github.com/moby/sys/mountinfo"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/urfave/cli"
 )
 
 // Holds sysbox-specific config
 type Sysbox struct {
-	Id                  string
-	Mgr                 *Mgr
-	Fs                  *Fs
-	RootfsUidShiftType  sh.IDShiftType
-	BindMntUidShiftType sh.IDShiftType
-	RootfsCloned        bool
-	SwitchDockerDns     bool
-	OrigRootfs          string
-	OrigMounts          []specs.Mount
-	IDshiftIgnoreList   []string
+	Id                    string
+	Mgr                   *Mgr
+	Fs                    *Fs
+	RootfsUidShiftType    sh.IDShiftType
+	BindMntUidShiftType   sh.IDShiftType
+	RootfsCloned          bool
+	SwitchDockerDns       bool
+	OrigRootfs            string
+	OrigMounts            []specs.Mount
+	IDshiftIgnoreList     []string
+	// External UserNS (K8s/Containerd-provided mappings)
+	ExternalUserNS       bool
+	ExternalUidMappings   []specs.LinuxIDMapping
+	ExternalGidMappings   []specs.LinuxIDMapping
 }
 
 func NewSysbox(id string, withMgr, withFs bool) *Sysbox {
@@ -142,6 +148,32 @@ func needUidShiftOnRootfs(spec *specs.Spec) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// RootfsOnIDMappedMount returns true if the given rootfs path is located on an
+// ID-mapped mount (e.g., as set up by K8s/Containerd). Used to avoid double-shifting
+// when ExternalUserNS is true and the rootfs is already ID-mapped.
+func RootfsOnIDMappedMount(rootfs string) (bool, error) {
+	abs, err := filepath.Abs(rootfs)
+	if err != nil {
+		return false, err
+	}
+	mi, err := mountinfo.GetMounts(mountinfo.ParentsFilter(abs))
+	if err != nil {
+		return false, err
+	}
+	if len(mi) < 1 {
+		return false, nil
+	}
+	var idx, maxlen int
+	for i := range mi {
+		if len(mi[i].Mountpoint) > maxlen {
+			maxlen = len(mi[i].Mountpoint)
+			idx = i
+		}
+	}
+	optional := mi[idx].Optional
+	return strings.Contains(optional, "idmap"), nil
 }
 
 // checkUidShifting returns the type of UID shifting needed (if any) for the

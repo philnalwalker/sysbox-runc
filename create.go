@@ -7,6 +7,7 @@ import (
 	"github.com/opencontainers/runc/libsysbox/sysbox"
 	"github.com/opencontainers/runc/libsysbox/syscont"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
@@ -78,16 +79,27 @@ command(s) that get executed on start, edit the args parameter of the spec. See
 			return err
 		}
 
+		// Detect external User Namespace (K8s/Containerd-provided UID/GID mappings)
+		externalUserNS := spec.Linux != nil && len(spec.Linux.UIDMappings) > 0
+		if externalUserNS {
+			logrus.Info("Detected external User Namespace in OCI spec. Sysbox will honor these mappings.")
+		}
+
 		id := context.Args().First()
 
 		withMgr := !context.GlobalBool("no-sysbox-mgr")
 		withFs := !context.GlobalBool("no-sysbox-fs")
 
 		sysbox := sysbox.NewSysbox(id, withMgr, withFs)
+		if externalUserNS {
+			sysbox.ExternalUserNS = true
+			sysbox.ExternalUidMappings = spec.Linux.UIDMappings
+			sysbox.ExternalGidMappings = spec.Linux.GIDMappings
+		}
 
 		// register with sysMgr
 		if sysbox.Mgr.Enabled() {
-			if err = sysbox.Mgr.Register(spec); err != nil {
+			if err = sysbox.Mgr.Register(spec, sysbox); err != nil {
 				return err
 			}
 			defer func() {
